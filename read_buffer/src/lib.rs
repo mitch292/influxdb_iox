@@ -11,6 +11,7 @@ pub(crate) mod table;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fmt,
+    rc::Rc,
     sync::RwLock,
 };
 
@@ -493,7 +494,7 @@ impl fmt::Debug for Database {
 struct ChunkData {
     // The collection of chunks in the partition. Each chunk is uniquely
     // identified by a chunk id.
-    chunks: BTreeMap<u32, Chunk>,
+    chunks: BTreeMap<u32, Rc<Chunk>>,
 
     // The current total size of the partition.
     size: u64,
@@ -522,7 +523,7 @@ impl Partition {
                 size: chunk.size(),
                 row_groups: chunk.row_groups(),
                 rows: chunk.rows(),
-                chunks: vec![(chunk.id(), chunk)].into_iter().collect(),
+                chunks: vec![(chunk.id(), Rc::new(chunk))].into_iter().collect(),
             }),
         }
     }
@@ -549,13 +550,16 @@ impl Partition {
                 chunk.upsert_table(table_name, row_group);
             }
             Entry::Vacant(chunk_entry) => {
-                chunk_entry.insert(Chunk::new(chunk_id, Table::new(table_name, row_group)));
+                chunk_entry.insert(Rc::new(Chunk::new(
+                    chunk_id,
+                    Table::new(table_name, row_group),
+                )));
             }
         };
     }
 
     // Drops the chunk and all associated data.
-    fn drop_chunk(&mut self, chunk_id: u32) -> Result<Chunk> {
+    fn drop_chunk(&mut self, chunk_id: u32) -> Result<Rc<Chunk>> {
         let mut chunk_data = self.data.write().unwrap();
 
         match chunk_data.chunks.remove(&chunk_id) {
@@ -620,8 +624,8 @@ impl Partition {
 }
 
 /// ReadFilterResults implements ...
-pub struct ReadFilterResults<'input, 'chunk> {
-    chunks: Vec<&'chunk Chunk>,
+pub struct ReadFilterResults<'input, 'a> {
+    chunks: Vec<&'a Rc<Chunk>>,
     next_i: usize,
     curr_table_results: Option<table::ReadFilterResults>,
 
@@ -630,7 +634,7 @@ pub struct ReadFilterResults<'input, 'chunk> {
     select_columns: table::ColumnSelection<'input>,
 }
 
-impl<'input, 'chunk> fmt::Debug for ReadFilterResults<'input, 'chunk> {
+impl<'input, 'a> fmt::Debug for ReadFilterResults<'input, 'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadFilterResults")
             .field("chunks.len", &self.chunks.len())
@@ -643,9 +647,9 @@ impl<'input, 'chunk> fmt::Debug for ReadFilterResults<'input, 'chunk> {
     }
 }
 
-impl<'input, 'chunk> ReadFilterResults<'input, 'chunk> {
+impl<'input, 'a> ReadFilterResults<'input, 'a> {
     fn new(
-        chunks: Vec<&'chunk Chunk>,
+        chunks: Vec<&'a Rc<Chunk>>,
         table_name: &'input str,
         predicate: Predicate,
         select_columns: table::ColumnSelection<'input>,
@@ -661,7 +665,7 @@ impl<'input, 'chunk> ReadFilterResults<'input, 'chunk> {
     }
 }
 
-impl<'input, 'chunk> Iterator for ReadFilterResults<'input, 'chunk> {
+impl<'input, 'a> Iterator for ReadFilterResults<'input, 'a> {
     type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -716,7 +720,7 @@ impl<'input, 'chunk> Iterator for ReadFilterResults<'input, 'chunk> {
 /// this iterator returns a record batch. Therefore the caller can expect at
 /// most one record batch to be yielded for each chunk.
 pub struct ReadAggregateResults<'input, 'chunk> {
-    chunks: Vec<&'chunk Chunk>,
+    chunks: Vec<&'chunk Rc<Chunk>>,
     next_i: usize,
 
     table_name: &'input str,
@@ -727,7 +731,7 @@ pub struct ReadAggregateResults<'input, 'chunk> {
 
 impl<'input, 'chunk> ReadAggregateResults<'input, 'chunk> {
     fn new(
-        chunks: Vec<&'chunk Chunk>,
+        chunks: Vec<&'chunk Rc<Chunk>>,
         table_name: &'input str,
         predicate: Predicate,
         group_columns: table::ColumnSelection<'input>,
