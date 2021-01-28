@@ -11,6 +11,7 @@ pub(crate) mod table;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fmt,
+    sync::RwLock,
 };
 
 use arrow_deps::{arrow::record_batch::RecordBatch, util::str_iter_to_batch};
@@ -58,6 +59,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 // partitions, chunks, tables and row groups.
 #[derive(Default)]
 pub struct Database {
+    data: RwLock<PartitionData>,
+}
+#[derive(Default)]
+struct PartitionData {
     // The collection of partitions for the database. Each partition is uniquely
     // identified by a partition key
     partitions: BTreeMap<String, Partition>,
@@ -86,19 +91,17 @@ impl Database {
         table_name: &str,
         table_data: RecordBatch,
     ) {
-        // validate table data contains appropriate meta data.
-        let schema = table_data.schema();
-        if schema.fields().len() != schema.metadata().len() {
-            todo!("return error with missing column types for fields")
-        }
-
+        // This call is expensive. Complete it before locking.
         let row_group = RowGroup::from(table_data);
-        self.size += row_group.size();
-        self.rows += row_group.rows() as u64;
+
+        // Take lock on partitions and update.
+        let mut partition_data = self.data.write().unwrap();
+        partition_data.size += row_group.size();
+        partition_data.rows += row_group.rows() as u64;
 
         // create a new chunk if one doesn't exist, or add the table data to
         // the existing chunk.
-        match self.partitions.entry(partition_key.to_owned()) {
+        match partition_data.partitions.entry(partition_key.to_owned()) {
             Entry::Occupied(mut e) => {
                 let partition = e.get_mut();
                 partition.upsert_chunk(chunk_id, table_name.to_owned(), row_group);
@@ -112,60 +115,84 @@ impl Database {
         };
     }
 
-    /// Remove all row groups, tables and chunks within the specified partition
-    /// key.
+    /// Remove all row groups, tables and chunks associated with the specified
+    /// partition key.
+    ///
+    /// This operation requires a write lock on the database, but the duration
+    /// of time the lock is held is limited only to the time needed to update
+    /// containers and drop memory.
     pub fn drop_partition(&mut self, partition_key: &str) -> Result<()> {
-        if self.partitions.remove(partition_key).is_some() {
-            return Ok(());
-        }
+        let mut partition_data = self.data.write().unwrap();
 
-        Err(Error::PartitionNotFound {
-            key: partition_key.to_owned(),
-        })
+        match partition_data.partitions.remove(partition_key) {
+            Some(partition) => {
+                partition_data.size -= partition.size();
+                partition_data.rows -= partition.rows();
+                Ok(())
+            }
+            None => Err(Error::PartitionNotFound {
+                key: partition_key.to_owned(),
+            }),
+        }
     }
 
     /// Remove all row groups and tables for the specified chunks and partition.
     pub fn drop_chunk(&mut self, partition_key: &str, chunk_id: u32) -> Result<()> {
-        let partition = self
-            .partitions
-            .get_mut(partition_key)
-            .ok_or(Error::PartitionNotFound {
-                key: partition_key.to_owned(),
-            })?;
+        let mut partition_data = self.data.write().unwrap();
 
-        if partition.chunks.remove(&chunk_id).is_some() {
-            return Ok(());
-        }
+        let partition =
+            partition_data
+                .partitions
+                .get_mut(partition_key)
+                .ok_or(Error::PartitionNotFound {
+                    key: partition_key.to_owned(),
+                })?;
 
-        Err(Error::ChunkNotFound { id: chunk_id })
+        partition.drop_chunk(chunk_id).and_then(|chunk| {
+            partition_data.size -= chunk.size();
+            partition_data.rows -= chunk.rows();
+            Ok(())
+        })
     }
 
-    // Lists all partition keys with data for this database.
-    pub fn partition_keys(&self) -> Vec<&String> {
-        self.partitions.keys().collect()
+    /// Clones and returns all partition keys with data for this database.
+    pub fn partition_keys(&self) -> Vec<String> {
+        self.data
+            .read()
+            .unwrap()
+            .partitions
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Lists all chunk ids in the given partition key. Returns empty
     /// `Vec` if no partition with the given key exists
     pub fn chunk_ids(&self, partition_key: &str) -> Vec<u32> {
-        self.partitions
+        self.data
+            .read()
+            .unwrap()
+            .partitions
             .get(partition_key)
             .map(|partition| partition.chunk_ids())
             .unwrap_or_default()
     }
 
     pub fn size(&self) -> u64 {
-        self.size
+        self.data.read().unwrap().size
     }
 
     pub fn rows(&self) -> u64 {
-        self.rows
+        self.data.read().unwrap().rows
     }
 
     /// Determines the total number of tables under all partitions within the
     /// database.
     pub fn tables(&self) -> usize {
-        self.partitions
+        self.data
+            .read()
+            .unwrap()
+            .partitions
             .values()
             .map(|partition| partition.tables())
             .sum()
@@ -174,11 +201,29 @@ impl Database {
     /// Determines the total number of row groups under all tables under all
     /// chunks, within the database.
     pub fn row_groups(&self) -> usize {
-        self.partitions
+        self.data
+            .read()
+            .unwrap()
+            .partitions
             .values()
             .map(|chunk| chunk.row_groups())
             .sum()
     }
+
+    // Internal functions useful for testing.
+
+    // // Get a reference to a single chunk. Panics if it or the partition doesn't
+    // // exist.
+    // fn chunk(&self, partition_key: &str, chunk_id: u32) -> &Chunk {
+    //     &self
+    //         .data
+    //         .read()
+    //         .unwrap()
+    //         .partitions
+    //         .get(partition_key)
+    //         .unwrap()
+    //         .chunk(chunk_id)
+    // }
 
     /// Returns rows for the specified columns in the provided table, for the
     /// specified partition key and chunks within that partition.
@@ -202,23 +247,23 @@ impl Database {
         predicate: Predicate,
         select_columns: ColumnSelection<'a>,
     ) -> Result<ReadFilterResults<'a, '_>> {
-        match self.partitions.get(partition_key) {
+        let partition_data = self.data.read().unwrap();
+
+        match partition_data.partitions.get(partition_key) {
             Some(partition) => {
                 let mut chunks = vec![];
                 for chunk_id in chunk_ids {
                     let chunk = partition
+                        .data
+                        .read()
+                        .unwrap()
                         .chunks
                         .get(chunk_id)
                         .context(ChunkNotFound { id: *chunk_id })?;
 
                     ensure!(chunk.has_table(table_name), TableNotFound { table_name });
 
-                    chunks.push(
-                        partition
-                            .chunks
-                            .get(chunk_id)
-                            .ok_or_else(|| Error::ChunkNotFound { id: *chunk_id })?,
-                    )
+                    chunks.push(chunk);
                 }
 
                 // TODO(edd): encapsulate execution of `read_filter` on each chunk
@@ -263,23 +308,21 @@ impl Database {
         group_columns: ColumnSelection<'input>,
         aggregates: Vec<(ColumnName<'input>, AggregateType)>,
     ) -> Result<ReadAggregateResults<'input, '_>> {
-        match self.partitions.get(partition_key) {
+        match self.data.read().unwrap().partitions.get(partition_key) {
             Some(partition) => {
                 let mut chunks = vec![];
                 for chunk_id in chunk_ids {
                     let chunk = partition
+                        .data
+                        .read()
+                        .unwrap()
                         .chunks
                         .get(chunk_id)
                         .context(ChunkNotFound { id: *chunk_id })?;
 
                     ensure!(chunk.has_table(table_name), TableNotFound { table_name });
 
-                    chunks.push(
-                        partition
-                            .chunks
-                            .get(chunk_id)
-                            .ok_or_else(|| Error::ChunkNotFound { id: *chunk_id })?,
-                    )
+                    chunks.push(chunk);
                 }
 
                 for (_, agg) in &aggregates {
@@ -377,15 +420,28 @@ impl Database {
         chunk_ids: &[u32],
         predicate: Predicate,
     ) -> Result<RecordBatch> {
-        let partition = self
-            .partitions
-            .get(partition_key)
-            .ok_or(Error::PartitionNotFound {
-                key: partition_key.to_owned(),
-            })?;
+        let partition_data = self.data.read().unwrap();
 
-        let chunks = partition.chunks_by_ids(chunk_ids)?;
-        let names = chunks
+        let partition =
+            partition_data
+                .partitions
+                .get(partition_key)
+                .ok_or(Error::PartitionNotFound {
+                    key: partition_key.to_owned(),
+                })?;
+
+        let chunk_data = partition.data.read().unwrap();
+        let mut filtered_chunks = vec![];
+        for id in chunk_ids {
+            filtered_chunks.push(
+                chunk_data
+                    .chunks
+                    .get(id)
+                    .ok_or_else(|| Error::ChunkNotFound { id: *id })?,
+            );
+        }
+
+        let names = filtered_chunks
             .iter()
             .fold(BTreeSet::new(), |mut names, chunk| {
                 // notice that `names` is pushed into the chunk `table_name`
@@ -425,19 +481,16 @@ impl Database {
 
 impl fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let partition_data = self.data.read().unwrap();
         f.debug_struct("Database")
-            .field("partitions", &self.partitions.keys())
-            .field("size", &self.size)
+            .field("partitions", &partition_data.partitions.keys())
+            .field("size", &partition_data.size)
             .finish()
     }
 }
 
-// A partition is a collection of `Chunks`.
 #[derive(Default)]
-pub struct Partition {
-    // The partition's key
-    key: String,
-
+struct ChunkData {
     // The collection of chunks in the partition. Each chunk is uniquely
     // identified by a chunk id.
     chunks: BTreeMap<u32, Chunk>,
@@ -445,20 +498,33 @@ pub struct Partition {
     // The current total size of the partition.
     size: u64,
 
+    // The current number of row groups in this partition.
+    row_groups: usize,
+
     // Total number of rows in the partition.
     rows: u64,
 }
 
+// A partition is a collection of `Chunks`.
+#[derive(Default)]
+struct Partition {
+    // The partition's key
+    key: String,
+
+    data: RwLock<ChunkData>,
+}
+
 impl Partition {
     pub fn new(partition_key: &str, chunk: Chunk) -> Self {
-        let mut p = Self {
+        Self {
             key: partition_key.to_owned(),
-            size: chunk.size(),
-            rows: chunk.rows(),
-            chunks: BTreeMap::new(),
-        };
-        p.chunks.insert(chunk.id(), chunk);
-        p
+            data: RwLock::new(ChunkData {
+                size: chunk.size(),
+                row_groups: chunk.row_groups(),
+                rows: chunk.rows(),
+                chunks: vec![(chunk.id(), chunk)].into_iter().collect(),
+            }),
+        }
     }
 
     /// Adds new data for a chunk.
@@ -466,54 +532,90 @@ impl Partition {
     /// Data should be provided as a single row group for a table within the
     /// chunk. If the `Table` or `Chunk` does not exist they will be created,
     /// otherwise relevant structures will be updated.
+    ///
+    /// This operation locks the partition for the duration of the call.
     fn upsert_chunk(&mut self, chunk_id: u32, table_name: String, row_group: RowGroup) {
-        self.size += row_group.size();
-        self.rows += row_group.rows() as u64;
+        let mut chunk_data = self.data.write().unwrap();
+
+        chunk_data.size += row_group.size();
+        chunk_data.row_groups += 1;
+        chunk_data.rows += row_group.rows() as u64;
 
         // create a new chunk if one doesn't exist, or add the table data to
         // the existing chunk.
-        match self.chunks.entry(chunk_id) {
-            Entry::Occupied(mut e) => {
-                let chunk = e.get_mut();
+        match chunk_data.chunks.entry(chunk_id) {
+            Entry::Occupied(mut chunk_entry) => {
+                let chunk = chunk_entry.get_mut();
                 chunk.upsert_table(table_name, row_group);
             }
-            Entry::Vacant(e) => {
-                e.insert(Chunk::new(chunk_id, Table::new(table_name, row_group)));
+            Entry::Vacant(chunk_entry) => {
+                chunk_entry.insert(Chunk::new(chunk_id, Table::new(table_name, row_group)));
             }
         };
     }
 
+    // Drops the chunk and all associated data.
+    fn drop_chunk(&mut self, chunk_id: u32) -> Result<Chunk> {
+        let mut chunk_data = self.data.write().unwrap();
+
+        match chunk_data.chunks.remove(&chunk_id) {
+            Some(chunk) => {
+                chunk_data.size -= chunk.size();
+                chunk_data.rows -= chunk.rows();
+                Ok(chunk)
+            }
+            None => Err(Error::ChunkNotFound { id: chunk_id }),
+        }
+    }
+
     /// Return the chunk ids stored in this partition, in order of id
     fn chunk_ids(&self) -> Vec<u32> {
-        self.chunks.keys().cloned().collect()
+        self.data.read().unwrap().chunks.keys().cloned().collect()
     }
 
-    fn chunks_by_ids(&self, ids: &[u32]) -> Result<Vec<&Chunk>> {
-        let mut chunks = vec![];
-        for chunk_id in ids {
-            chunks.push(
-                self.chunks
-                    .get(chunk_id)
-                    .ok_or_else(|| Error::ChunkNotFound { id: *chunk_id })?,
-            );
-        }
-        Ok(chunks)
-    }
+    // fn chunks_by_ids(&self, ids: &[u32]) -> Result<Vec<&Chunk>> {
+    //     let chunks = &self.data.read().unwrap().chunks;
+
+    //     let mut filtered_chunks = vec![];
+    //     for chunk_id in ids {
+    //         filtered_chunks.push(
+    //             chunks
+    //                 .get(chunk_id)
+    //                 .ok_or_else(|| Error::ChunkNotFound { id: *chunk_id })?,
+    //         );
+    //     }
+    //     Ok(filtered_chunks)
+    // }
+
+    // Returns the chunk or panics. Useful for internal testing.
+    // fn chunk(&self, id: u32) -> &Chunk {
+    //     self.data.read().unwrap().chunks.get(&id).unwrap()
+    // }
 
     /// Determines the total number of tables under all chunks within the
-    /// partition.
-    pub fn tables(&self) -> usize {
-        self.chunks.values().map(|chunk| chunk.tables()).sum()
+    /// partition. Useful for tests but not something that is highly performant.
+    fn tables(&self) -> usize {
+        self.data
+            .read()
+            .unwrap()
+            .chunks
+            .values()
+            .map(|chunk| chunk.tables())
+            .sum()
     }
 
     /// Determines the total number of row groups under all tables under all
     /// chunks, within the partition.
     pub fn row_groups(&self) -> usize {
-        self.chunks.values().map(|chunk| chunk.row_groups()).sum()
+        self.data.read().unwrap().row_groups
     }
 
     pub fn rows(&self) -> u64 {
-        self.rows
+        self.data.read().unwrap().rows
+    }
+
+    pub fn size(&self) -> u64 {
+        self.data.read().unwrap().size
     }
 }
 
@@ -745,10 +847,13 @@ mod test {
         assert_eq!(db.tables(), 1);
         assert_eq!(db.row_groups(), 1);
 
-        let partition = db.partitions.values().next().unwrap();
-        assert_eq!(partition.tables(), 1);
-        assert_eq!(partition.rows(), 3);
-        assert_eq!(partition.row_groups(), 1);
+        {
+            let partition_data = db.data.read().unwrap();
+            let partition = partition_data.partitions.values().next().unwrap();
+            assert_eq!(partition.tables(), 1);
+            assert_eq!(partition.rows(), 3);
+            assert_eq!(partition.row_groups(), 1);
+        }
 
         // Updating the chunk with another row group for the table just adds
         // that row group to the existing table.
@@ -757,10 +862,13 @@ mod test {
         assert_eq!(db.tables(), 1); // still one table
         assert_eq!(db.row_groups(), 2);
 
-        let partition = db.partitions.values().next().unwrap();
-        assert_eq!(partition.tables(), 1); // it's the same table.
-        assert_eq!(partition.rows(), 6);
-        assert_eq!(partition.row_groups(), 2);
+        {
+            let partition_data = db.data.read().unwrap();
+            let partition = partition_data.partitions.values().next().unwrap();
+            assert_eq!(partition.tables(), 1); // it's the same table.
+            assert_eq!(partition.rows(), 6);
+            assert_eq!(partition.row_groups(), 2);
+        }
 
         // Adding the same data under another table would increase the table
         // count.
@@ -769,10 +877,13 @@ mod test {
         assert_eq!(db.tables(), 2);
         assert_eq!(db.row_groups(), 3);
 
-        let partition = db.partitions.values().next().unwrap();
-        assert_eq!(partition.tables(), 2);
-        assert_eq!(partition.rows(), 9);
-        assert_eq!(partition.row_groups(), 3);
+        {
+            let partition_data = db.data.read().unwrap();
+            let partition = partition_data.partitions.values().next().unwrap();
+            assert_eq!(partition.tables(), 2);
+            assert_eq!(partition.rows(), 9);
+            assert_eq!(partition.row_groups(), 3);
+        }
 
         // Adding the data under another chunk adds a new chunk.
         db.upsert_partition("hour_1", 29, "a_table", gen_recordbatch());
@@ -780,34 +891,43 @@ mod test {
         assert_eq!(db.tables(), 3); // two distinct tables but across two chunks.
         assert_eq!(db.row_groups(), 4);
 
-        let partition = db.partitions.values().next().unwrap();
-        assert_eq!(partition.tables(), 3);
-        assert_eq!(partition.rows(), 12);
-        assert_eq!(partition.row_groups(), 4);
+        {
+            let partition_data = db.data.read().unwrap();
+            let partition = partition_data.partitions.values().next().unwrap();
+            assert_eq!(partition.tables(), 3);
+            assert_eq!(partition.rows(), 12);
+            assert_eq!(partition.row_groups(), 4);
+        }
 
-        let chunk_22 = db
-            .partitions
-            .get("hour_1")
-            .unwrap()
-            .chunks
-            .values()
-            .next()
-            .unwrap();
-        assert_eq!(chunk_22.tables(), 2);
-        assert_eq!(chunk_22.rows(), 9);
-        assert_eq!(chunk_22.row_groups(), 3);
+        {
+            let partition_data = db.data.read().unwrap();
+            let chunk_data = partition_data
+                .partitions
+                .get("hour_1")
+                .unwrap()
+                .data
+                .read()
+                .unwrap();
+            let chunk_22 = chunk_data.chunks.get(&22).unwrap();
+            assert_eq!(chunk_22.tables(), 2);
+            assert_eq!(chunk_22.rows(), 9);
+            assert_eq!(chunk_22.row_groups(), 3);
+        }
 
-        let chunk_29 = db
-            .partitions
-            .get("hour_1")
-            .unwrap()
-            .chunks
-            .values()
-            .nth(1)
-            .unwrap();
-        assert_eq!(chunk_29.tables(), 1);
-        assert_eq!(chunk_29.rows(), 3);
-        assert_eq!(chunk_29.row_groups(), 1);
+        {
+            let partition_data = db.data.read().unwrap();
+            let chunk_data = partition_data
+                .partitions
+                .get("hour_1")
+                .unwrap()
+                .data
+                .read()
+                .unwrap();
+            let chunk_29 = chunk_data.chunks.get(&29).unwrap();
+            assert_eq!(chunk_29.tables(), 1);
+            assert_eq!(chunk_29.rows(), 3);
+            assert_eq!(chunk_29.row_groups(), 1);
+        }
     }
 
     // Helper function to assert the contents of a column on a record batch.
