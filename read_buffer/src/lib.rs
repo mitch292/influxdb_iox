@@ -614,6 +614,15 @@ impl ReadFilterResults {
             next_chunk: 0,
         }
     }
+
+    pub fn schema(&self) -> Result<ResultSchema> {
+        self.all_chunks_table_results.iter().map(|table_result| {
+            // merge the chunk (table's) schema together to get the "merged schema"
+            let _: &ResultSchema = table_result.schema();
+        });
+
+        Ok(ResultSchema::default())
+    }
 }
 
 impl Iterator for ReadFilterResults {
