@@ -30,7 +30,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use arrow_deps::{
     arrow,
     arrow::{
-        array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder},
+        array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, UInt64Builder, StringBuilder},
         datatypes::DataType as ArrowDataType,
         record_batch::RecordBatch,
     },
@@ -702,6 +702,7 @@ impl Table {
                         schema_builder.field(column_name, ArrowDataType::Int64)
                     }
                 }
+                Column::U64(_, _) => schema_builder.field(column_name, ArrowDataType::UInt64),
                 Column::Bool(_, _) => schema_builder.field(column_name, ArrowDataType::Boolean),
             };
         }
@@ -768,6 +769,15 @@ impl Table {
                 }
                 Column::I64(vals, _) => {
                     let mut builder = Int64Builder::new(vals.len());
+
+                    for v in vals {
+                        builder.append_option(*v).context(ArrowError {})?;
+                    }
+
+                    Arc::new(builder.finish()) as ArrayRef
+                }
+                Column::U64(vals, _) => {
+                    let mut builder = UInt64Builder::new(vals.len());
 
                     for v in vals {
                         builder.append_option(*v).context(ArrowError {})?;
@@ -880,6 +890,7 @@ impl Table {
         match column {
             Column::F64(v, _) => self.column_value_matches_predicate(v, chunk_predicate),
             Column::I64(v, _) => self.column_value_matches_predicate(v, chunk_predicate),
+            Column::U64(v, _) => self.column_value_matches_predicate(v, chunk_predicate),
             Column::String(v, _) => self.column_value_matches_predicate(v, chunk_predicate),
             Column::Bool(v, _) => self.column_value_matches_predicate(v, chunk_predicate),
             Column::Tag(v, _) => self.column_value_matches_predicate(v, chunk_predicate),
@@ -921,6 +932,7 @@ impl Table {
             let stats = match c {
                 Column::F64(_, stats) => Statistics::F64(stats.clone()),
                 Column::I64(_, stats) => Statistics::I64(stats.clone()),
+                Column::U64(_, stats) => Statistics::U64(stats.clone()),
                 Column::Bool(_, stats) => Statistics::Bool(stats.clone()),
                 Column::String(_, stats) | Column::Tag(_, stats) => {
                     Statistics::String(stats.clone())
