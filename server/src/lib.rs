@@ -82,7 +82,6 @@ use std::sync::{
 };
 
 use crate::{
-    buffer::SegmentPersistenceTask,
     config::{object_store_path_for_database_config, Config, DB_RULES_FILE_NAME},
     db::Db,
     tracker::TrackerRegistry,
@@ -159,6 +158,12 @@ pub struct Server<M: ConnectionManager> {
     pub store: Arc<ObjectStore>,
     executor: Arc<Executor>,
     segment_persistence_registry: TrackerRegistry<SegmentPersistenceTask>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentPersistenceTask {
+    writer_id: u32,
+    segment_id: u64,
 }
 
 impl<M: ConnectionManager> Server<M> {
@@ -361,9 +366,15 @@ impl<M: ConnectionManager> Server<M> {
                 if persist {
                     let writer_id = self.require_id()?;
                     let store = Arc::clone(&self.store);
+
+                    let tracker = self.segment_persistence_registry.register(SegmentPersistenceTask{
+                        writer_id,
+                        segment_id: segment.id
+                    });
+
                     segment
                         .persist_bytes_in_background(
-                            &self.segment_persistence_registry,
+                            tracker,
                             writer_id,
                             db_name,
                             store,
