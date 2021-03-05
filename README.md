@@ -174,13 +174,13 @@ cargo build --release
 which will create the corresponding binary in `target/release`:
 
 ```shell
-./target/release/influxdb_iox
+./target/release/influxdb_iox --help
 ```
 
 Similarly, you can do this in one step with:
 
 ```shell
-cargo run --release
+cargo run --release -- --help
 ```
 
 The server will, by default, start an HTTP API server on port `8080` and a gRPC server on port
@@ -192,24 +192,12 @@ Each IOx instance requires a writer ID.
 This can be set three ways:
 - set an environment variable `INFLUXDB_IOX_ID=42`
 - set a flag `--writer-id 42`
-- send an HTTP PUT request:
-```
-curl --request PUT \
-  --url http://localhost:8080/iox/api/v1/id \
-  --header 'Content-Type: application/json' \
-  --data '{
-  "id": 42
-  }'
-```
+- set using the CLI: `influxdb_iox writer set 42` or `cargo run -- writer set 42`
 
-To write data, you need a destination database.
-This is set via HTTP PUT, identifying the database by org `company` and bucket `sensors`:
+To write data, you need a destination database. 
+
 ```
-curl --request PUT \
-  --url http://localhost:8080/iox/api/v1/databases/company_sensors \
-  --header 'Content-Type: application/json' \
-  --data '{
-}'
+influxdb_iox database create company_sensors -m 10000
 ```
 
 Data can be stored in InfluxDB IOx by sending it in [line protocol] format to the `/api/v2/write`
@@ -229,7 +217,7 @@ To query stored data, use the `/api/v2/read` endpoint with a SQL query. This exa
 all data in the `company` organization's `sensors` bucket for the `processes` measurement:
 
 ```shell
-curl -v -G -d 'org=company' -d 'bucket=sensors' --data-urlencode 'sql_query=select * from processes' "http://127.0.0.1:8080/api/v2/read"
+curl -v -G --data-urlencode 'q=select * from processes' -d 'format=pretty' "http://127.0.0.1:8080/iox/api/v1/databases/company_sensors/query"
 ```
 
 ### Health Checks
